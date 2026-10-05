@@ -21,6 +21,7 @@ from agent_framework.security import (
 from agent_framework_tools._feature_usage import FeatureIndex
 from agent_framework_tools.shell import LocalShellTool, ShellCommandError, ShellPolicy, ShellResult
 from agent_framework_tools.shell._executor import _popen_kwargs_for_group, run_stateless
+from agent_framework_tools.shell._session import ShellSession
 
 _TEST_SHELL = "agent-framework-test-shell"
 _APPROVED_COMMAND = "printf '%s' approved-value"
@@ -290,6 +291,73 @@ async def test_run_stateless_timeout_returns_empty_output_if_drain_fails() -> No
     assert result.timed_out is True
     assert result.stdout == ""
     assert result.stderr == ""
+
+
+async def test_queued_run_restarts_session_after_previous_run_closes_it() -> None:
+    """A queued command should restart a session torn down by the previous command."""
+    session = ShellSession(["/bin/sh"])
+
+    first_started = asyncio.Event()
+    allow_first_to_finish = asyncio.Event()
+    call_count = 0
+
+    async def fake_run_locked(command: str, *, timeout: float | None) -> ShellResult:
+        nonlocal call_count
+        call_count += 1
+
+        if call_count == 1:
+            first_started.set()
+            await allow_first_to_finish.wait()
+
+            # Simulate an unrecoverable timeout tearing down the persistent
+            # shell before returning its timeout result.
+            await session.close()
+
+            return ShellResult(
+                stdout=command,
+                stderr="",
+                exit_code=-1,
+                duration_ms=0,
+                truncated=False,
+                timed_out=True,
+            )
+
+        # A queued command must have restarted the session after acquiring
+        # the run lock.
+        if session._proc is None:  # pyright: ignore[reportPrivateUsage]
+            raise RuntimeError("ShellSession is not running; call start() first")
+
+        return ShellResult(
+            stdout=command,
+            stderr="",
+            exit_code=0,
+            duration_ms=0,
+            truncated=False,
+            timed_out=False,
+        )
+
+    with patch.object(session, "_run_locked", side_effect=fake_run_locked):
+        first = asyncio.create_task(session.run("first", timeout=1.0))
+        await first_started.wait()
+
+        # Queue a second command while the first command still owns the run lock.
+        second = asyncio.create_task(session.run("second", timeout=1.0))
+
+        # Give the second task a chance to execute start() and then block on
+        # the run lock before the first command tears down the session.
+        await asyncio.sleep(0)
+
+        allow_first_to_finish.set()
+
+        first_result = await first
+        second_result = await second
+
+    await session.close()
+
+    assert first_result.timed_out is True
+    assert first_result.stdout == "first"
+    assert second_result.timed_out is False
+    assert second_result.stdout == "second"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="persistent-mode sentinel on POSIX")

@@ -200,8 +200,8 @@ class ShellSession:
         timeout: float | None,
     ) -> ShellResult:
         """Run ``command`` in the live session and return its result."""
-        await self.start()
         async with self._run_lock:
+            await self.start()
             return await self._run_locked(command, timeout=timeout)
 
     async def _run_locked(self, command: str, *, timeout: float | None) -> ShellResult:
